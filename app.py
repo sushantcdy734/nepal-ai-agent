@@ -57,23 +57,36 @@ if prompt := st.chat_input("Ask me something..."):
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Get agent response
+    # Stream agent response
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            try:
-                result = chat(prompt, history=st.session_state.get("history", []))
-                response_text = result["response"]
-                tools_used = result["tools_used"]
-                st.session_state["history"] = result["history"]
-            except Exception as e:
-                response_text = f"⚠️ Something went wrong: {str(e)}"
-                tools_used = []
+        status_placeholder = st.empty()
+        response_placeholder = st.empty()
 
-        st.markdown(response_text)
+        full_response = ""
+        tools_used = []
+        new_history = st.session_state.get("history", [])
+
+        try:
+            for event in chat(prompt, history=new_history):
+                if event["type"] == "status":
+                    status_placeholder.caption(event["data"])
+                elif event["type"] == "text":
+                    full_response += event["data"]
+                    response_placeholder.markdown(full_response + "▌")
+                elif event["type"] == "tool_used":
+                    tools_used.append(event["data"])
+                elif event["type"] == "done":
+                    status_placeholder.empty()
+                    response_placeholder.markdown(full_response)
+                    new_history = event["data"]["history"]
+        except Exception as e:
+            response_placeholder.error(f"Something went wrong: {e}")
+            full_response = "⚠️ The agent hit an error."
 
         if tools_used:
             with st.expander(f"🔧 Used {len(tools_used)} tool(s)"):
                 for t in tools_used:
                     st.code(f"{t['tool']}({t['args']})", language="python")
 
-    st.session_state.messages.append({"role": "assistant", "content": response_text})
+    st.session_state["history"] = new_history
+    st.session_state.messages.append({"role": "assistant", "content": full_response})

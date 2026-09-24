@@ -12,7 +12,7 @@ from tools.calculator import calculate
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-MODEL = "openai/gpt-oss-120b"  # bigger model — better at tool loops
+MODEL = "openai/gpt-oss-120b"
 
 # ------------------------------------------------------------
 # Tool definitions
@@ -79,19 +79,67 @@ def run_tool(tool_name: str, tool_args: dict) -> str:
         return f"Error running {tool_name}: {str(e)}"
 
 
-SYSTEM_PROMPT = (
-    "You are a helpful AI assistant with two tools: web_search and calculate.\n\n"
-    "RULES:\n"
-    "1. ALWAYS use 'calculate' for any arithmetic — never compute in your head.\n"
-    "2. Use 'web_search' for current events, weather, news, or facts you're unsure about.\n"
-    "3. Call a tool ONCE with a clear query. Do NOT repeat the same tool call.\n"
-    "4. After getting a tool result, use it to give your final answer immediately.\n"
-    "5. If the tool result is unclear, just answer with what you have.\n"
-    "Be concise. Cite sources when you use search."
-)
+# ------------------------------------------------------------
+# System prompt — this shapes the agent's personality & style
+# ------------------------------------------------------------
+SYSTEM_PROMPT = """You are Nepal Data Assistant — a professional AI agent built by Sushant Chaudhary.
+
+## Your identity
+- You are knowledgeable, thoughtful, and precise.
+- You have two tools: `web_search` and `calculate`.
+- You explain your reasoning clearly, not just answer mechanically.
+
+## Tool use rules
+1. ALWAYS use `calculate` for any arithmetic. Never compute in your head.
+2. Use `web_search` for current events, weather, news, prices, or facts you're unsure about.
+3. When you use web_search, cite the source URL inline like this: [source](url).
+4. Do NOT repeat the same tool call. If the result is unclear, work with what you have.
+
+## Response style
+- Be **thorough but focused**. Match your answer length to the question.
+  - Simple question → 1-3 sentences.
+  - Complex question → use headings, bullets, and short paragraphs.
+- Use **markdown formatting**: bold key terms, bullets for lists, code blocks for code, headers for sections.
+- For math, show your work: the expression, the result, and a one-line explanation.
+- For factual answers from search, always cite the source.
+- Never start with "Sure!" or "Great question!". Just answer.
+
+## When you're unsure
+- Say so explicitly: "I couldn't find a reliable source, but based on general knowledge..."
+- Never invent facts. Hallucination is worse than an honest "I don't know."
+
+## Tone
+- Professional, clear, and calm — like a senior colleague explaining something.
+- Warm but not casual. No emojis unless the user uses them first.
+
+## Example of a good answer
+User: "What's the current temperature in Kathmandu and what's 25% of 66?"
+
+Your answer:
+Kathmandu is currently **19°C (66°F)** with partly cloudy skies [source](https://www.accuweather.com/).
+
+25% of 66 = **16.5** (calculated as 66 × 0.25).
+
+**Summary:** Around 19°C in Kathmandu — comfortable weather if you're heading out.
+
+## Example of a bad answer
+"I searched the web and the answer is 19 degrees and 16.5"
+"""
 
 
-def chat(user_message: str, history: list = None) -> dict:
+# ------------------------------------------------------------
+# Streaming chat — yields events as the agent thinks
+# ------------------------------------------------------------
+def chat(user_message: str, history: list = None):
+    """
+    Streaming chat. Yields events as the agent thinks and responds.
+
+    Event types:
+        {"type": "status",    "data": "Using web_search..."}
+        {"type": "text",      "data": "partial text chunk"}
+        {"type": "tool_used", "data": {"tool": ..., "args": ...}}
+        {"type": "done",      "data": {"history": ..., "tools_used": [...]}}
+    """
     if history is None:
         history = []
 
@@ -99,77 +147,101 @@ def chat(user_message: str, history: list = None) -> dict:
         history.append({"role": "system", "content": SYSTEM_PROMPT})
 
     history.append({"role": "user", "content": user_message})
-
     tools_used = []
-    seen_calls = set()  # track (tool_name, args) to prevent loops
+    seen_calls = set()
 
-    for iteration in range(5):
-        response = client.chat.completions.create(
+    for _ in range(5):
+        # ---- Create a streaming completion ----
+        stream = client.chat.completions.create(
             model=MODEL,
             messages=history,
             tools=TOOLS,
             tool_choice="auto",
+            stream=True,
         )
 
-        message = response.choices[0].message
+        text_buffer = ""
+        tool_calls_buffer = []
 
-        # ---- No tool call → final answer ----
-        if not message.tool_calls:
-            final = message.content or ""
-            history.append({"role": "assistant", "content": final})
-            return {"response": final, "history": history, "tools_used": tools_used}
+        # ---- Consume the stream chunk by chunk ----
+        for chunk in stream:
+            if not chunk.choices:
+                continue
 
-        # ---- Process tool calls ----
-        history.append({
-            "role": "assistant",
-            "content": message.content,
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in message.tool_calls
-            ],
-        })
+            delta = chunk.choices[0].delta
 
-        duplicate_found = False
-        for tool_call in message.tool_calls:
-            tool_name = tool_call.function.name
-            tool_args = json.loads(tool_call.function.arguments)
+            # Tool call deltas
+            if getattr(delta, "tool_calls", None):
+                for tc in delta.tool_calls:
+                    idx = tc.index if tc.index is not None else 0
+                    while len(tool_calls_buffer) <= idx:
+                        tool_calls_buffer.append({"id": "", "name": "", "arguments": ""})
+                    if tc.id:
+                        tool_calls_buffer[idx]["id"] = tc.id
+                    if tc.function:
+                        if tc.function.name:
+                            tool_calls_buffer[idx]["name"] = tc.function.name
+                        if tc.function.arguments:
+                            tool_calls_buffer[idx]["arguments"] += tc.function.arguments
 
-            call_sig = (tool_name, json.dumps(tool_args, sort_keys=True))
+            # Text deltas — stream to the UI immediately
+            if delta.content:
+                text_buffer += delta.content
+                yield {"type": "text", "data": delta.content}
 
-            if call_sig in seen_calls:
-                # Model repeated the same call — break the loop
-                duplicate_found = True
-                result = (
-                    "You already called this tool with the same argument. "
-                    "Please give your final answer now using the previous result."
-                )
-            else:
-                seen_calls.add(call_sig)
-                tools_used.append({"tool": tool_name, "args": tool_args})
-                result = run_tool(tool_name, tool_args)
-
+        # ---- If the model made tool calls, execute them ----
+        if tool_calls_buffer:
             history.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": result,
+                "role": "assistant",
+                "content": text_buffer or None,
+                "tool_calls": [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": tc["arguments"],
+                        },
+                    }
+                    for tc in tool_calls_buffer
+                ],
             })
 
-        if duplicate_found:
-            # Force a final answer on the next loop iteration
-            history.append({
-                "role": "user",
-                "content": "Stop calling tools. Give me your final answer now based on the results you already have.",
-            })
+            for tc in tool_calls_buffer:
+                tool_name = tc["name"]
+                try:
+                    tool_args = json.loads(tc["arguments"])
+                except json.JSONDecodeError:
+                    tool_args = {}
 
-    return {
-        "response": "Agent reached maximum iterations.",
-        "history": history,
-        "tools_used": tools_used,
-    }
+                call_sig = (tool_name, json.dumps(tool_args, sort_keys=True))
+
+                if call_sig in seen_calls:
+                    # Duplicate — nudge the model to finish
+                    result = (
+                        "You already called this tool with the same arguments. "
+                        "Use the previous result to answer now."
+                    )
+                else:
+                    seen_calls.add(call_sig)
+                    yield {"type": "status", "data": f"Using **{tool_name}**..."}
+                    tools_used.append({"tool": tool_name, "args": tool_args})
+                    yield {"type": "tool_used", "data": {"tool": tool_name, "args": tool_args}}
+                    result = run_tool(tool_name, tool_args)
+
+                history.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result,
+                })
+
+            # Loop back so the model can produce the final answer
+            continue
+
+        # ---- No tool calls — this was the final answer ----
+        history.append({"role": "assistant", "content": text_buffer})
+        yield {"type": "done", "data": {"history": history, "tools_used": tools_used}}
+        return
+
+    # Ran out of iterations
+    yield {"type": "done", "data": {"history": history, "tools_used": tools_used}}
