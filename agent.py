@@ -92,16 +92,25 @@ SYSTEM_PROMPT = """You are Nepal Data Assistant — a professional AI agent buil
 ## Tool use rules
 1. ALWAYS use `calculate` for any arithmetic. Never compute in your head.
 2. Use `web_search` for current events, weather, news, prices, or facts you're unsure about.
-3. When you use web_search, cite the source URL inline like this: [source](url).
-4. Do NOT repeat the same tool call. If the result is unclear, work with what you have.
+3. Call `web_search` AT MOST TWICE per question. If the first results are unclear, use what you have and give your best answer.
+4. After using a tool, immediately give your final answer using the result.
+5. Do NOT keep calling tools hoping for a better result. Work with what you get.
+
+## Formatting rules — VERY IMPORTANT
+- Write all math in PLAIN TEXT. Never use LaTeX notation.
+  - GOOD: 847 × 213 + 1200 = 181,611
+  - BAD: \\(847 \\times 213 + 1{,}200 = 181{,}611\\)
+- Use standard characters: × for multiplication, / for division.
+- Do not use `\\times`, `\\[`, `\\]`, `\\(`, `\\)`, or wrap numbers in `{}`.
+- Use markdown for structure (headers, bold, bullets) but keep the content plain.
 
 ## Response style
 - Be **thorough but focused**. Match your answer length to the question.
   - Simple question → 1-3 sentences.
   - Complex question → use headings, bullets, and short paragraphs.
-- Use **markdown formatting**: bold key terms, bullets for lists, code blocks for code, headers for sections.
+- Use **markdown formatting**: bold key terms, bullets for lists.
 - For math, show your work: the expression, the result, and a one-line explanation.
-- For factual answers from search, always cite the source.
+- For factual answers from search, cite the source URL inline like [source](url).
 - Never start with "Sure!" or "Great question!". Just answer.
 
 ## When you're unsure
@@ -116,14 +125,11 @@ SYSTEM_PROMPT = """You are Nepal Data Assistant — a professional AI agent buil
 User: "What's the current temperature in Kathmandu and what's 25% of 66?"
 
 Your answer:
-Kathmandu is currently **19°C (66°F)** with partly cloudy skies [source](https://www.accuweather.com/).
+Kathmandu is currently 19°C (66°F) with partly cloudy skies [source](https://www.accuweather.com/).
 
-25% of 66 = **16.5** (calculated as 66 × 0.25).
+25% of 66 = 16.5 (calculated as 66 × 0.25).
 
 **Summary:** Around 19°C in Kathmandu — comfortable weather if you're heading out.
-
-## Example of a bad answer
-"I searched the web and the answer is 19 degrees and 16.5"
 """
 
 
@@ -150,15 +156,23 @@ def chat(user_message: str, history: list = None):
     tools_used = []
     seen_calls = set()
 
-    for _ in range(5):
+    # After this many iterations, force the model to answer without tools
+    FORCE_FINAL_AFTER = 3
+
+    for iteration in range(6):
+        force_final = iteration >= FORCE_FINAL_AFTER
+
+        create_kwargs = {
+            "model": MODEL,
+            "messages": history,
+            "stream": True,
+        }
+        if not force_final:
+            create_kwargs["tools"] = TOOLS
+            create_kwargs["tool_choice"] = "auto"
+
         # ---- Create a streaming completion ----
-        stream = client.chat.completions.create(
-            model=MODEL,
-            messages=history,
-            tools=TOOLS,
-            tool_choice="auto",
-            stream=True,
-        )
+        stream = client.chat.completions.create(**create_kwargs)
 
         text_buffer = ""
         tool_calls_buffer = []
@@ -189,8 +203,8 @@ def chat(user_message: str, history: list = None):
                 text_buffer += delta.content
                 yield {"type": "text", "data": delta.content}
 
-        # ---- If the model made tool calls, execute them ----
-        if tool_calls_buffer:
+        # ---- If the model made tool calls AND we're not forcing final, execute them ----
+        if tool_calls_buffer and not force_final:
             history.append({
                 "role": "assistant",
                 "content": text_buffer or None,
@@ -220,7 +234,7 @@ def chat(user_message: str, history: list = None):
                     # Duplicate — nudge the model to finish
                     result = (
                         "You already called this tool with the same arguments. "
-                        "Use the previous result to answer now."
+                        "Use the previous result to give your final answer now."
                     )
                 else:
                     seen_calls.add(call_sig)
@@ -235,10 +249,20 @@ def chat(user_message: str, history: list = None):
                     "content": result,
                 })
 
-            # Loop back so the model can produce the final answer
+            # After 1 tool round, nudge the model to finish next time
+            if iteration >= 1:
+                history.append({
+                    "role": "user",
+                    "content": (
+                        "You have enough information now. Give your final answer "
+                        "using the tool results above. Do NOT call any more tools. "
+                        "Do NOT use LaTeX — plain text math only."
+                    ),
+                })
+
             continue
 
-        # ---- No tool calls — this was the final answer ----
+        # ---- No tool calls (or forced final) — this is the answer ----
         history.append({"role": "assistant", "content": text_buffer})
         yield {"type": "done", "data": {"history": history, "tools_used": tools_used}}
         return
